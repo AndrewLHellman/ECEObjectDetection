@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import rclpy
-import rclpy
+from rclpy.node import Node
 
 from sensor_msgs.msg import Image
 
@@ -15,7 +15,7 @@ class ObjectDetector(Node):
             10)
         self.subscription
 
-    def subscription_callback(self, msg):
+    def image_callback(self, msg):
         pass
 
 def main():
