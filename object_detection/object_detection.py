@@ -1,605 +1,525 @@
 #!/usr/bin/env python3
-"""
-ROS2 node: ObjectDetector (reproj + constellation association)
-Fix: robust parsing of CameraInfo.P / CameraInfo.D to avoid
-"truth value of an array is ambiguous" errors.
-"""
+from __future__ import annotations
 import math
 from typing import List, Tuple, Optional
 
+import cv2
 import numpy as np
-import cv2 as cv
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from rclpy.time import Time
-from rclpy.duration import Duration
-
-from cv_bridge import CvBridge
 
 from sensor_msgs.msg import Image, CameraInfo
-from geometry_msgs.msg import PoseArray, Pose, Quaternion
-from std_msgs.msg import Header, Float32
+from geometry_msgs.msg import Pose, PoseArray, Point, Quaternion, Vector3
+from std_msgs.msg import Header, ColorRGBA
+from visualization_msgs.msg import Marker, MarkerArray
 
 import tf2_ros
+import tf_transformations as tft
+from cv_bridge import CvBridge
+
+
+# ------------------------- Helpers -------------------------
+
+def _as_float(x):
+    return float(x)
+
+
+def color(r, g, b, a=1.0) -> ColorRGBA:
+    return ColorRGBA(r=_as_float(r), g=_as_float(g), b=_as_float(b), a=_as_float(a))
+
+
+def contour_is_rectangular(cnt, min_area, min_rectangularity, min_solidity) -> bool:
+    area = cv2.contourArea(cnt)
+    if area < min_area:
+        return False
+    hull = cv2.convexHull(cnt)
+    hull_area = max(cv2.contourArea(hull), 1.0)
+    solidity = area / hull_area
+    rect = cv2.minAreaRect(cnt)
+    box = cv2.boxPoints(rect)
+    box = np.intp(box)
+    rect_area = max(cv2.contourArea(box), 1.0)
+    rectangularity = area / rect_area
+    return (solidity >= min_solidity) and (rectangularity >= min_rectangularity)
+
+
+def centroid_of_contour(cnt) -> Optional[Tuple[float, float]]:
+    M = cv2.moments(cnt)
+    if abs(M["m00"]) < 1e-9:
+        return None
+    return (float(M["m10"]/M["m00"]), float(M["m01"]/M["m00"]))
+
+
+def ray_from_cam_info(u: float, v: float, info: CameraInfo, source: str = 'P') -> np.ndarray:
+    """Return unit ray in *camera* frame given pixel (u,v).
+    If using rectified images (image_proc/image_rect), use Projection matrix P (no distortion).
+    If using raw images (image_raw), use K and *also* undistort before if needed (not done here).
+    """
+    if source.upper() == 'P':
+        # P = [fx 0 cx Tx; 0 fy cy Ty; 0 0 1 0]
+        P = np.array(info.p, dtype=np.float64).reshape(3, 4)
+        fx, fy, cx, cy = P[0, 0], P[1, 1], P[0, 2], P[1, 2]
+    else:
+        K = np.array(info.k, dtype=np.float64).reshape(3, 3)
+        fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+    x = (u - cx) / fx
+    y = (v - cy) / fy
+    ray = np.array([x, y, 1.0], dtype=np.float64)
+    n = np.linalg.norm(ray)
+    return ray / (n + 1e-12)
+
+
+def intersect_ray_with_plane(p0: np.ndarray, d: np.ndarray, n: np.ndarray, d_plane: float) -> Optional[np.ndarray]:
+    denom = float(np.dot(n, d))
+    if abs(denom) < 1e-9:
+        return None
+    t = -(float(np.dot(n, p0)) + d_plane) / denom
+    if t < 0:
+        return None
+    return p0 + t * d
+
+
+def closest_points_between_lines(p1: np.ndarray, d1: np.ndarray,
+                                 p2: np.ndarray, d2: np.ndarray) -> Optional[Tuple[np.ndarray, float]]:
+    a = float(np.dot(d1, d1))
+    b = float(np.dot(d1, d2))
+    c = float(np.dot(d2, d2))
+    w0 = p1 - p2
+    d = a * c - b * b
+    if abs(d) < 1e-12:
+        return None
+    s = (b * float(np.dot(d2, w0)) - c * float(np.dot(d1, w0))) / d
+    t = (a * float(np.dot(d2, w0)) - b * float(np.dot(d1, w0))) / d
+    p_closest1 = p1 + s * d1
+    p_closest2 = p2 + t * d2
+    midpoint = 0.5 * (p_closest1 + p_closest2)
+    return midpoint, float(np.linalg.norm(p_closest1 - p_closest2))
+
+
+class SyncPair:
+    def __init__(self, slop=0.05):
+        self.slop = slop
+        self.left = None
+        self.right = None
+
+    def put_left(self, msg):
+        self.left = msg
+
+    def put_right(self, msg):
+        self.right = msg
+
+    def ready(self):
+        if self.left is None or self.right is None:
+            return False
+        tL = self.left.header.stamp.sec + self.left.header.stamp.nanosec * 1e-9
+        tR = self.right.header.stamp.sec + self.right.header.stamp.nanosec * 1e-9
+        return abs(tL - tR) <= self.slop
+
+    def pop(self):
+        L, R = self.left, self.right
+        self.left = None
+        self.right = None
+        return L, R
 
 
 class ObjectDetector(Node):
     def __init__(self):
         super().__init__('object_detector')
 
-        # ---------------- Params ----------------
-        self.declare_parameter('left_image', '/stereo/left/image_raw')
-        self.declare_parameter('right_image', '/stereo/right/image_raw')
-        self.declare_parameter('left_info', '/stereo/left/camera_info')
-        self.declare_parameter('right_info', '/stereo/right/camera_info')
-
+        # Frames & topics
         self.declare_parameter('world_frame', 'world')
         self.declare_parameter('left_cam_frame', 'left_camera')
         self.declare_parameter('right_cam_frame', 'right_camera')
+        self.declare_parameter('left_image', '/stereo/left/image_rect')
+        self.declare_parameter('right_image', '/stereo/right/image_rect')
+        self.declare_parameter('left_info', '/stereo/left/camera_info')
+        self.declare_parameter('right_info', '/stereo/right/camera_info')
 
-        self.declare_parameter('use_general_plane', False)
+        self.declare_parameter('intrinsics_source', 'P')
+
+        # Detection
+        self.declare_parameter('blur_ksize', 7)
+        self.declare_parameter('morph_open', 1)
+        self.declare_parameter('morph_close', 5)
+        self.declare_parameter('min_area', 1200.0)
+        self.declare_parameter('min_rectangularity', 0.7)
+        self.declare_parameter('min_solidity', 0.8)
+        self.declare_parameter('use_adaptive', False)
+        self.declare_parameter('global_thresh', 90)
+
+        # Association & fusion
+        self.declare_parameter('publish_unpaired', False)
+        self.declare_parameter('assoc_plane_gate_m', 0.10)
+        self.declare_parameter('assoc_symmetric', True)
+        self.declare_parameter('triangulate_3d', True)
+        self.declare_parameter('min_ray_angle_deg', 1.0)
+        self.declare_parameter('max_triang_gap_m', 0.08)
+        self.declare_parameter('debug_pairs', False)
+
+        # Plane (n·X + d = 0)
         self.declare_parameter('plane_n', [0.0, 0.0, 1.0])
         self.declare_parameter('plane_d', 0.0)
 
-        self.declare_parameter('assoc_mode', 'reproj')   # 'reproj' | 'constellation'
-        self.declare_parameter('assoc_pixel_gate', 20.0)
-        self.declare_parameter('symmetric_match', True)
-        self.declare_parameter('use_undistort_assoc', True)
+        # Load params once
+        gp = self.get_parameter
+        self.world_frame = gp('world_frame').get_parameter_value().string_value
+        self.left_cam_frame = gp('left_cam_frame').get_parameter_value().string_value
+        self.right_cam_frame = gp('right_cam_frame').get_parameter_value().string_value
+        self.left_image_topic = gp('left_image').get_parameter_value().string_value
+        self.right_image_topic = gp('right_image').get_parameter_value().string_value
+        self.left_info_topic = gp('left_info').get_parameter_value().string_value
+        self.right_info_topic = gp('right_info').get_parameter_value().string_value
 
-        self.declare_parameter('triangulate_3d', False)
-        self.declare_parameter('min_ray_angle_deg', 1.0)
+        # Defaults (will be refreshed live each cycle)
+        self.publish_unpaired = gp('publish_unpaired').get_parameter_value().bool_value
+        self.assoc_plane_gate_m = float(gp('assoc_plane_gate_m').get_parameter_value().double_value)
+        self.assoc_symmetric = gp('assoc_symmetric').get_parameter_value().bool_value
+        self.do_triang = gp('triangulate_3d').get_parameter_value().bool_value
+        self.min_ray_angle = math.radians(float(gp('min_ray_angle_deg').get_parameter_value().double_value))
+        self.max_triang_gap = float(gp('max_triang_gap_m').get_parameter_value().double_value)
+        self.debug_pairs = gp('debug_pairs').get_parameter_value().bool_value
 
-        self.declare_parameter('use_adaptive', True)
-        self.declare_parameter('binary_inv', True)
-        self.declare_parameter('blur_ksize', 5)
-        self.declare_parameter('adaptive_block', 31)
-        self.declare_parameter('adaptive_C', 5)
-        self.declare_parameter('global_thresh', 60)
-        self.declare_parameter('morph_open', 3)
-        self.declare_parameter('morph_close', 3)
+        self.plane_n = np.array(gp('plane_n').get_parameter_value().double_array_value, dtype=np.float64)
+        self.plane_d = float(gp('plane_d').get_parameter_value().double_value)
 
-        self.declare_parameter('min_area', 400.0)
-        self.declare_parameter('max_area', 1_000_000.0)
-        self.declare_parameter('min_solidity', 0.75)
-        self.declare_parameter('min_rectangularity', 0.65)
-        self.declare_parameter('min_aspect', 0.2)
-        self.declare_parameter('max_aspect', 5.0)
+        self.intrinsics_source = self.get_parameter('intrinsics_source').get_parameter_value().string_value
 
-        self.declare_parameter('draw_contours', True)
-        self.declare_parameter('max_labels', 50)
-        self.declare_parameter('debug_reprojection', True)
-        self.declare_parameter('debug_max_pairs', 40)
-
-        # ---------------- Setup ----------------
         qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
             depth=5,
         )
+
         self.bridge = CvBridge()
+        self.left_info: Optional[CameraInfo] = None
+        self.right_info: Optional[CameraInfo] = None
+        self.K_left: Optional[np.ndarray] = None
+        self.K_right: Optional[np.ndarray] = None
 
-        self.left_img_topic = self.get_parameter('left_image').get_parameter_value().string_value
-        self.right_img_topic = self.get_parameter('right_image').get_parameter_value().string_value
-        self.left_info_topic = self.get_parameter('left_info').get_parameter_value().string_value
-        self.right_info_topic = self.get_parameter('right_info').get_parameter_value().string_value
+        self.sync = SyncPair(slop=0.05)
 
-        # Intrinsics/state
-        self.left_K = None
-        self.right_K = None
-        self.left_D = None
-        self.right_D = None
-        self.left_P = None
-        self.right_P = None
-        self.left_cam_frame = self.get_parameter('left_cam_frame').get_parameter_value().string_value
-        self.right_cam_frame = self.get_parameter('right_cam_frame').get_parameter_value().string_value
+        self.sub_left_img = self.create_subscription(Image, self.left_image_topic, self.cb_left_img, qos)
+        self.sub_right_img = self.create_subscription(Image, self.right_image_topic, self.cb_right_img, qos)
+        self.sub_left_info = self.create_subscription(CameraInfo, self.left_info_topic, self.cb_left_info, qos)
+        self.sub_right_info = self.create_subscription(CameraInfo, self.right_info_topic, self.cb_right_info, qos)
 
-        # TF
-        self.world_frame = self.get_parameter('world_frame').get_parameter_value().string_value
-        self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=2.0))
+        self.pub_poses = self.create_publisher(PoseArray, '/prism_centroids', 10)
+        self.pub_markers = self.create_publisher(MarkerArray, '/prism_markers', 10)
+        self.pub_dbg_left = self.create_publisher(Image, '/debug/left', 1)
+        self.pub_dbg_right = self.create_publisher(Image, '/debug/right', 1)
+        self.pub_pair_markers = self.create_publisher(MarkerArray, '/pair_markers', 10)
+
+        self.tf_buffer = tf2_ros.Buffer(cache_time=rclpy.duration.Duration(seconds=3.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        # Subscriptions
-        self.sub_left_img = self.create_subscription(Image, self.left_img_topic, self.on_left, qos)
-        self.sub_right_img = self.create_subscription(Image, self.right_img_topic, self.on_right, qos)
-        self.sub_left_info = self.create_subscription(CameraInfo, self.left_info_topic, self.on_left_info, qos)
-        self.sub_right_info = self.create_subscription(CameraInfo, self.right_info_topic, self.on_right_info, qos)
+        self.timer = self.create_timer(1.0/30.0, self.process_if_ready)
 
-        # Publishers
-        self.pub_left_2d = self.create_publisher(PoseArray, '/stereo/left/prism_centroids', 10)
-        self.pub_right_2d = self.create_publisher(PoseArray, '/stereo/right/prism_centroids', 10)
-        self.pub_left_world = self.create_publisher(PoseArray, '/stereo/left/prism_centroids_world', 10)
-        self.pub_right_world = self.create_publisher(PoseArray, '/stereo/right/prism_centroids_world', 10)
-        self.pub_fused_world = self.create_publisher(PoseArray, '/stereo/fused/prism_centroids_world', 10)
-        self.pub_fused_world_3d = self.create_publisher(PoseArray, '/stereo/fused/prism_centroids_world_3d', 10)
-        self.pub_left_dbg = self.create_publisher(Image, '/stereo/left/centroid_image', 10)
-        self.pub_right_dbg = self.create_publisher(Image, '/stereo/right/centroid_image', 10)
-        self.pub_left_reproj = self.create_publisher(Image, '/stereo/left/reproj_debug', 10)
-        self.pub_right_reproj = self.create_publisher(Image, '/stereo/right/reproj_debug', 10)
-        self.pub_const_rms = self.create_publisher(Float32, '/stereo/fused/constellation_rms_px', 10)
+        self.get_logger().info('ObjectDetector (fused) initialized.')
 
-        # Buffers
-        self.left_last = None
-        self.right_last = None
-
-        self.get_logger().info('ObjectDetector ready (reproj + constellation association).')
-
-    # -------- CameraInfo helpers --------
-    @staticmethod
-    def _list_or_empty(seq) -> list:
+    # --------- Runtime param refresh so ros2 param set works mid-run ---------
+    def refresh_runtime_params(self):
         try:
-            return list(seq) if seq is not None else []
-        except Exception:
+            self.publish_unpaired = self.get_parameter('publish_unpaired').get_parameter_value().bool_value
+            self.assoc_plane_gate_m = float(self.get_parameter('assoc_plane_gate_m').get_parameter_value().double_value)
+            self.assoc_symmetric = self.get_parameter('assoc_symmetric').get_parameter_value().bool_value
+            self.do_triang = self.get_parameter('triangulate_3d').get_parameter_value().bool_value
+            self.min_ray_angle = math.radians(float(self.get_parameter('min_ray_angle_deg').get_parameter_value().double_value))
+            self.max_triang_gap = float(self.get_parameter('max_triang_gap_m').get_parameter_value().double_value)
+            self.debug_pairs = self.get_parameter('debug_pairs').get_parameter_value().bool_value
+            # Vision live tweaks (optional)
+            self.use_adaptive = self.get_parameter('use_adaptive').get_parameter_value().bool_value
+            self.global_thresh = int(self.get_parameter('global_thresh').get_parameter_value().integer_value)
+            self.min_area = float(self.get_parameter('min_area').get_parameter_value().double_value)
+        except Exception as e:
+            self.get_logger().warn(f'Runtime param refresh failed: {e}')
+
+    # --------------------- Callbacks ---------------------
+    def cb_left_info(self, msg: CameraInfo):
+        self.left_info = msg
+        self.K_left = np.array(msg.k, dtype=np.float64).reshape(3, 3)
+
+    def cb_right_info(self, msg: CameraInfo):
+        self.right_info = msg
+        self.K_right = np.array(msg.k, dtype=np.float64).reshape(3, 3)
+
+    def cb_left_img(self, msg: Image):
+        self.sync.put_left(msg)
+
+    def cb_right_img(self, msg: Image):
+        self.sync.put_right(msg)
+
+    # --------------------- Main processing ---------------------
+    def process_if_ready(self):
+        # Pick up live param changes
+        self.refresh_runtime_params()
+
+        if self.K_left is None or self.K_right is None:
+            return
+        if not self.sync.ready():
+            return
+
+        left_img_msg, right_img_msg = self.sync.pop()
+
+        try:
+            left_cv = self.bridge.imgmsg_to_cv2(left_img_msg, desired_encoding='bgr8')
+            right_cv = self.bridge.imgmsg_to_cv2(right_img_msg, desired_encoding='bgr8')
+        except Exception as e:
+            self.get_logger().warn(f'cv_bridge conversion failed: {e}')
+            return
+
+        detL, dbgL = self.detect_rectangles(left_cv)
+        detR, dbgR = self.detect_rectangles(right_cv)
+
+        self.pub_dbg_left.publish(self.bridge.cv2_to_imgmsg(dbgL, encoding='bgr8'))
+        self.pub_dbg_right.publish(self.bridge.cv2_to_imgmsg(dbgR, encoding='bgr8'))
+
+        raysL = self.make_rays(detL, self.left_info, self.left_cam_frame)
+        raysR = self.make_rays(detR, self.right_info, self.right_cam_frame)
+        ptsL_plane = self.intersect_rays_with_plane_world(raysL)
+        ptsR_plane = self.intersect_rays_with_plane_world(raysR)
+
+        pairs = self.associate_by_xy(ptsL_plane, ptsR_plane,
+                                     gate=self.assoc_plane_gate_m,
+                                     symmetric=self.assoc_symmetric)
+
+        stamp = left_img_msg.header.stamp
+        header = Header(stamp=stamp, frame_id=self.world_frame)
+        pa = PoseArray(header=header)
+        markers: List[Marker] = []
+        pair_markers: List[Marker] = []
+
+        fused_color = color(0.1, 0.8, 1.0, 0.95)
+        single_left_color = color(1.0, 0.6, 0.1, 0.9)
+        single_right_color = color(0.9, 0.2, 0.6, 0.9)
+        line_color = color(0.2, 1.0, 0.2, 0.8)
+        lonly_color = color(1.0, 0.0, 0.0, 0.6)
+        ronly_color = color(0.0, 0.0, 1.0, 0.6)
+        scale = Vector3(x=0.02, y=0.02, z=0.02)
+
+        # Debug: show all plane hits (left=red spheres, right=blue spheres)
+        if self.debug_pairs:
+            idx = 0
+            for P in ptsL_plane:
+                if P is None: continue
+                pos = Point(x=float(P[0]), y=float(P[1]), z=float(P[2]))
+                pair_markers.append(self.make_sphere_marker(idx, header, pos, Vector3(x=0.015, y=0.015, z=0.015), lonly_color, ns='plane_left'))
+                idx += 1
+            for P in ptsR_plane:
+                if P is None: continue
+                pos = Point(x=float(P[0]), y=float(P[1]), z=float(P[2]))
+                pair_markers.append(self.make_sphere_marker(idx, header, pos, Vector3(x=0.015, y=0.015, z=0.015), ronly_color, ns='plane_right'))
+                idx += 1
+
+        usedL = set()
+        usedR = set()
+
+        for iL, iR in pairs:
+            usedL.add(iL); usedR.add(iR)
+            pL, dL = raysL[iL]
+            pR, dR = raysR[iR]
+            fused_point = None
+
+            angle = math.acos(max(-1.0, min(1.0, float(np.dot(dL, dR)))))
+            gap_val = None
+            if self.do_triang and angle >= self.min_ray_angle:
+                res = closest_points_between_lines(pL, dL, pR, dR)
+                if res is not None:
+                    mid, gap = res
+                    gap_val = gap
+                    if gap <= self.max_triang_gap:
+                        fused_point = mid
+
+            if fused_point is None and ptsL_plane[iL] is not None and ptsR_plane[iR] is not None:
+                fused_point = 0.5 * (ptsL_plane[iL] + ptsR_plane[iR])
+
+            if self.debug_pairs and ptsL_plane[iL] is not None and ptsR_plane[iR] is not None:
+                # Draw a line between the two plane hits, and annotate distance
+                m = Marker()
+                m.header = header
+                m.ns = 'pair_lines'
+                m.id = iL * 1000 + iR
+                m.type = Marker.LINE_LIST
+                m.action = Marker.ADD
+                m.scale = Vector3(x=0.005, y=0.0, z=0.0)
+                m.color = line_color
+                m.points = [
+                    Point(x=float(ptsL_plane[iL][0]), y=float(ptsL_plane[iL][1]), z=float(ptsL_plane[iL][2])),
+                    Point(x=float(ptsR_plane[iR][0]), y=float(ptsR_plane[iR][1]), z=float(ptsR_plane[iR][2]))
+                ]
+                pair_markers.append(m)
+                dxy = float(np.linalg.norm(ptsL_plane[iL][0:2] - ptsR_plane[iR][0:2]))
+                self.get_logger().info(f"PAIR L{iL}-R{iR}: dXY={dxy:.3f} m, angle={math.degrees(angle):.2f} deg, gap={gap_val if gap_val is not None else -1:.3f} m")
+
+            if fused_point is None:
+                continue
+
+            pose = Pose()
+            pose.position.x, pose.position.y, pose.position.z = [float(v) for v in fused_point]
+            pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
+            pa.poses.append(pose)
+            markers.append(self.make_sphere_marker(len(markers), header, pose.position, scale, fused_color, ns='fused'))
+
+        # Optionally publish single-view plane hits
+        if self.publish_unpaired:
+            for iL, P in enumerate(ptsL_plane):
+                if P is None or iL in usedL: continue
+                pose = Pose(); pose.position = Point(x=float(P[0]), y=float(P[1]), z=float(P[2])); pose.orientation.w = 1.0
+                pa.poses.append(pose)
+                markers.append(self.make_sphere_marker(len(markers), header, pose.position, scale, single_left_color, ns='single_left'))
+            for iR, P in enumerate(ptsR_plane):
+                if P is None or iR in usedR: continue
+                pose = Pose(); pose.position = Point(x=float(P[0]), y=float(P[1]), z=float(P[2])); pose.orientation.w = 1.0
+                pa.poses.append(pose)
+                markers.append(self.make_sphere_marker(len(markers), header, pose.position, scale, single_right_color, ns='single_right'))
+
+        if len(pa.poses) > 0:
+            self.pub_poses.publish(pa)
+            self.pub_markers.publish(MarkerArray(markers=markers))
+        if self.debug_pairs and (len(pair_markers) > 0):
+            self.pub_pair_markers.publish(MarkerArray(markers=pair_markers))
+
+    # --------------------- Vision ---------------------
+    def detect_rectangles(self, bgr: np.ndarray):
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        ksize = self.get_parameter('blur_ksize').get_parameter_value().integer_value
+        if ksize > 1:
+            k = int(ksize) if ksize % 2 == 1 else int(ksize) + 1
+            gray = cv2.GaussianBlur(gray, (k, k), 0)
+
+        use_adapt = self.get_parameter('use_adaptive').get_parameter_value().bool_value
+        if use_adapt:
+            th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                       cv2.THRESH_BINARY_INV, 21, 5)
+        else:
+            thr = int(self.get_parameter('global_thresh').get_parameter_value().integer_value)
+            _, th = cv2.threshold(gray, thr, 255, cv2.THRESH_BINARY_INV)
+
+        mo = int(self.get_parameter('morph_open').get_parameter_value().integer_value)
+        mc = int(self.get_parameter('morph_close').get_parameter_value().integer_value)
+        if mo > 0:
+            th = cv2.morphologyEx(th, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (mo, mo)))
+        if mc > 0:
+            th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (mc, mc)))
+
+        contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        dets: List[Tuple[float, float]] = []
+        vis = cv2.cvtColor(th, cv2.COLOR_GRAY2BGR)
+        vis = cv2.addWeighted(bgr, 0.5, vis, 0.5, 0)
+
+        min_area = float(self.get_parameter('min_area').get_parameter_value().double_value)
+        min_rectangularity = float(self.get_parameter('min_rectangularity').get_parameter_value().double_value)
+        min_solidity = float(self.get_parameter('min_solidity').get_parameter_value().double_value)
+
+        for cnt in contours:
+            if not contour_is_rectangular(cnt, min_area, min_rectangularity, min_solidity):
+                continue
+            c = centroid_of_contour(cnt)
+            if c is None:
+                continue
+            dets.append(c)
+            cv2.drawContours(vis, [cnt], -1, (0, 255, 0), 2)
+            cv2.circle(vis, (int(c[0]), int(c[1])), 5, (0, 0, 255), -1)
+
+        return dets, vis
+
+    # --------------------- Geometry & TF ---------------------
+    def lookup_cam_to_world(self, cam_frame: str) -> Optional[np.ndarray]:
+        try:
+            tf_msg = self.tf_buffer.lookup_transform(self.world_frame, cam_frame, rclpy.time.Time())
+        except Exception as e:
+            self.get_logger().warn(f'TF {self.world_frame}->{cam_frame} not available: {e}')
+            return None
+        t = tf_msg.transform.translation
+        q = tf_msg.transform.rotation
+        T = tft.quaternion_matrix([q.x, q.y, q.z, q.w])
+        T[0, 3] = t.x; T[1, 3] = t.y; T[2, 3] = t.z
+        return T
+
+    def make_rays(self, dets_uv, info: CameraInfo, default_cam_frame: str):
+        cam_frame = info.header.frame_id or default_cam_frame
+        Twc = self.lookup_cam_to_world(cam_frame)
+        if Twc is None: return []
+        Rwc = Twc[0:3,0:3]; pw = Twc[0:3,3]
+        rays = []
+        for (u,v) in dets_uv:
+            d_cam = ray_from_cam_info(u, v, info, self.intrinsics_source)
+            d_world = Rwc @ d_cam
+            d_world /= (np.linalg.norm(d_world) + 1e-12)
+            rays.append((pw.copy(), d_world))
+        return rays
+
+    def intersect_rays_with_plane_world(self, rays: List[Tuple[np.ndarray, np.ndarray]]):
+        n = self.plane_n
+        d = self.plane_d
+        out: List[Optional[np.ndarray]] = []
+        for (p0, dvec) in rays:
+            P = intersect_ray_with_plane(p0, dvec, n, d)
+            out.append(P)
+        return out
+
+    def associate_by_xy(self,
+                        ptsL_world: List[Optional[np.ndarray]],
+                        ptsR_world: List[Optional[np.ndarray]],
+                        gate: float = 0.10,
+                        symmetric: bool = True) -> List[Tuple[int, int]]:
+        if not ptsL_world or not ptsR_world:
             return []
+        L_idx = [i for i, p in enumerate(ptsL_world) if p is not None]
+        R_idx = [j for j, p in enumerate(ptsR_world) if p is not None]
+        if len(L_idx) == 0 or len(R_idx) == 0:
+            return []
+        L_xy = np.array([ptsL_world[i][0:2] for i in L_idx])
+        R_xy = np.array([ptsR_world[j][0:2] for j in R_idx])
+        dists = np.linalg.norm(L_xy[:, None, :] - R_xy[None, :, :], axis=2)
 
-    @staticmethod
-    def _extract_K(msg: CameraInfo):
-        k = ObjectDetector._list_or_empty(msg.k)
-        if len(k) >= 9:
-            return (k[0], k[4], k[2], k[5])  # fx, fy, cx, cy
-        return None
+        pairs: List[Tuple[int, int]] = []
+        used_r: set[int] = set()
 
-    @staticmethod
-    def _extract_P(msg: CameraInfo):
-        p = ObjectDetector._list_or_empty(msg.p)
-        if len(p) >= 12:
-            return (p[0], p[5], p[2], p[6])  # fx, fy, cx, cy for rectified
-        return None
-
-    @staticmethod
-    def _extract_D(msg: CameraInfo):
-        d = ObjectDetector._list_or_empty(msg.d)
-        return d if len(d) > 0 else None
-
-    def on_left_info(self, msg: CameraInfo):
-        self.left_cam_frame = msg.header.frame_id or self.left_cam_frame
-        self.left_K = self._extract_K(msg)
-        self.left_P = self._extract_P(msg)
-        self.left_D = self._extract_D(msg)
-
-    def on_right_info(self, msg: CameraInfo):
-        self.right_cam_frame = msg.header.frame_id or self.right_cam_frame
-        self.right_K = self._extract_K(msg)
-        self.right_P = self._extract_P(msg)
-        self.right_D = self._extract_D(msg)
-
-    # ------------- Image callbacks -------------
-    def on_left(self, msg: Image):
-        self.process_camera('left', msg)
-
-    def on_right(self, msg: Image):
-        self.process_camera('right', msg)
-
-    # Core per-camera processing
-    def process_camera(self, which: str, img_msg: Image):
-        bgr = self.bridge.imgmsg_to_cv2(img_msg, desired_encoding='bgr8')
-        centroids_uv, dbg = self.detect_centroids(bgr)
-
-        # Publish 2D image-plane centroids
-        pa2d = self.poses_from_uv(centroids_uv, img_msg.header, self.left_cam_frame if which=='left' else self.right_cam_frame)
-        if which == 'left':
-            self.pub_left_2d.publish(pa2d)
-            dbg_msg = self.bridge.cv2_to_imgmsg(dbg, encoding='bgr8')
-            dbg_msg.header = img_msg.header
-            self.pub_left_dbg.publish(dbg_msg)
-        else:
-            self.pub_right_2d.publish(pa2d)
-            dbg_msg = self.bridge.cv2_to_imgmsg(dbg, encoding='bgr8')
-            dbg_msg.header = img_msg.header
-            self.pub_right_dbg.publish(dbg_msg)
-
-        # Project rays -> world + intersect plane
-        K = self.left_K if which=='left' else self.right_K
-        cam_frame = self.left_cam_frame if which=='left' else self.right_cam_frame
-        if K is None:
-            return
-
-        ok, Rwc, t_w = self.lookup_world_T_cam(cam_frame, img_msg.header.stamp)
-        if not ok:
-            return
-
-        world_pts = []
-        rays_world = []
-        fx, fy, cx, cy = K
-        n, d = self.get_plane()
-        for (u, v) in centroids_uv:
-            dc = np.array([(u - cx)/fx, (v - cy)/fy, 1.0], dtype=np.float64)
-            nrm = np.linalg.norm(dc)
-            if nrm == 0:
-                continue
-            dc /= nrm
-            dw = Rwc @ dc
-            ow = t_w
-            denom = float(n @ dw)
-            if abs(denom) < 1e-9:
-                continue
-            lam = - (n @ ow + d) / denom
-            if lam < 0:
-                continue
-            pw = ow + lam * dw
-            world_pts.append(pw)
-            rays_world.append(dw)
-
-        # Publish per-camera world points
-        pa = PoseArray()
-        pa.header = Header()
-        pa.header.stamp = img_msg.header.stamp
-        pa.header.frame_id = self.world_frame
-        for p in world_pts:
-            pose = Pose()
-            pose.position.x, pose.position.y, pose.position.z = [float(v) for v in p]
-            pose.orientation.w = 1.0
-            pa.poses.append(pose)
-        if which=='left':
-            self.pub_left_world.publish(pa)
-            self.left_last = (img_msg.header.stamp, centroids_uv, world_pts, rays_world, t_w, dbg)
-        else:
-            self.pub_right_world.publish(pa)
-            self.right_last = (img_msg.header.stamp, centroids_uv, world_pts, rays_world, t_w, dbg)
-
-        self.try_fuse()
-
-    # ------------- Detection -------------
-    def detect_centroids(self, bgr) -> Tuple[List[Tuple[float,float]], np.ndarray]:
-        p = lambda n: self.get_parameter(n).get_parameter_value()
-        use_adaptive = p('use_adaptive').bool_value
-        binary_inv = p('binary_inv').bool_value
-        blur_ksize = int(p('blur_ksize').integer_value)
-        adaptive_block = int(p('adaptive_block').integer_value)
-        adaptive_C = int(p('adaptive_C').integer_value)
-        global_thresh = int(p('global_thresh').integer_value)
-        morph_open = int(p('morph_open').integer_value)
-        morph_close = int(p('morph_close').integer_value)
-
-        min_area = float(p('min_area').double_value or p('min_area').integer_value)
-        max_area = float(p('max_area').double_value or p('max_area').integer_value)
-        min_solidity = float(p('min_solidity').double_value)
-        min_rect = float(p('min_rectangularity').double_value)
-        min_aspect = float(p('min_aspect').double_value)
-        max_aspect = float(p('max_aspect').double_value)
-        draw_contours = p('draw_contours').bool_value
-        max_labels = int(p('max_labels').integer_value)
-
-        gray = cv.cvtColor(bgr, cv.COLOR_BGR2GRAY)
-        if blur_ksize and blur_ksize > 1 and blur_ksize % 2 == 1:
-            gray = cv.GaussianBlur(gray, (blur_ksize, blur_ksize), 0)
-
-        if use_adaptive:
-            block = max(3, adaptive_block | 1)
-            thresh = cv.adaptiveThreshold(gray, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                          cv.THRESH_BINARY_INV if binary_inv else cv.THRESH_BINARY,
-                                          block, adaptive_C)
-        else:
-            _, thresh = cv.threshold(gray, global_thresh, 255,
-                                     cv.THRESH_BINARY_INV if binary_inv else cv.THRESH_BINARY)
-
-        def morph(img, ksize, op):
-            if ksize <= 0:
-                return img
-            k = cv.getStructuringElement(cv.MORPH_RECT, (ksize, ksize))
-            return cv.morphologyEx(img, op, k)
-
-        thresh = morph(thresh, morph_open, cv.MORPH_OPEN)
-        thresh = morph(thresh, morph_close, cv.MORPH_CLOSE)
-
-        contours, _ = cv.findContours(thresh, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-
-        centroids = []
-        dbg = cv.cvtColor(thresh, cv.COLOR_GRAY2BGR)
-        label_count = 0
-        for c in contours:
-            area = cv.contourArea(c)
-            if area < min_area or area > max_area:
-                continue
-            hull = cv.convexHull(c)
-            hull_area = cv.contourArea(hull) if len(hull) >= 3 else 0.0
-            if hull_area <= 0:
-                continue
-            solidity = area / hull_area
-            if solidity < min_solidity:
-                continue
-            rrect = cv.minAreaRect(c)
-            (rcx, rcy), (rw, rh), _ = rrect
-            rect_area = rw * rh
-            if rect_area <= 0:
-                continue
-            rectangularity = area / rect_area
-            aspect = (max(rw, rh) / (min(rw, rh) + 1e-6)) if min(rw, rh) > 0 else math.inf
-            if rectangularity < min_rect:
-                continue
-            if not (min_aspect <= aspect <= max_aspect):
-                continue
-            M = cv.moments(c)
-            if M['m00'] == 0:
-                continue
-            cxp = M['m10'] / M['m00']
-            cyp = M['m01'] / M['m00']
-            centroids.append((cxp, cyp))
-            if draw_contours and label_count < max_labels:
-                box = cv.boxPoints(rrect).astype(np.int32)
-                cv.drawContours(dbg, [box], 0, (0, 255, 0), 2)
-                cv.circle(dbg, (int(cxp), int(cyp)), 4, (0, 0, 255), -1)
-                cv.putText(dbg, f'({int(cxp)},{int(cyp)})', (int(cxp)+6, int(cyp)-6),
-                           cv.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 0), 1, cv.LINE_AA)
-                label_count += 1
-
-        overlay = cv.addWeighted(bgr, 0.6, dbg, 0.4, 0)
-        return centroids, overlay
-
-    # ------------- TF & plane helpers -------------
-    def lookup_world_T_cam(self, cam_frame: str, stamp) -> Tuple[bool, Optional[np.ndarray], Optional[np.ndarray]]:
-        for when in (Time.from_msg(stamp), Time()):
-            try:
-                tf_msg = self.tf_buffer.lookup_transform(self.world_frame, cam_frame, when, timeout=Duration(seconds=0.2))
-                t = tf_msg.transform.translation
-                q = tf_msg.transform.rotation
-                Rwc = self.quat_to_R(q)
-                tvec = np.array([t.x, t.y, t.z], dtype=np.float64)
-                return True, Rwc, tvec
-            except Exception:
-                continue
-        return False, None, None
-
-    def get_plane(self) -> Tuple[np.ndarray, float]:
-        if self.get_parameter('use_general_plane').get_parameter_value().bool_value:
-            n_list = self.get_parameter('plane_n').get_parameter_value().double_array_value
-            nx, ny, nz = n_list if len(n_list) == 3 else [0.0, 0.0, 1.0]
-            d = float(self.get_parameter('plane_d').get_parameter_value().double_value)
-            n = np.array([nx, ny, nz], dtype=np.float64)
-            n /= max(1e-9, np.linalg.norm(n))
-            return n, d
-        else:
-            return np.array([0.0, 0.0, 1.0], dtype=np.float64), 0.0
-
-    @staticmethod
-    def quat_to_R(q: Quaternion) -> np.ndarray:
-        qx, qy, qz, qw = q.x, q.y, q.z, q.w
-        xx, yy, zz = qx*qx, qy*qy, qz*qz
-        xy, xz, yz = qx*qy, qx*qz, qy*qz
-        wx, wy, wz = qw*qx, qw*qy, qw*qz
-        return np.array([
-            [1 - 2*(yy + zz), 2*(xy - wz),     2*(xz + wy)],
-            [2*(xy + wz),     1 - 2*(xx + zz), 2*(yz - wx)],
-            [2*(xz - wy),     2*(yz + wx),     1 - 2*(xx + yy)],
-        ], dtype=np.float64)
-
-    # ------------- Association modes -------------
-    @staticmethod
-    def undistort_uvs(uvs: List[Tuple[float, float]], K, D):
-        if K is None or D is None or len(uvs) == 0:
-            return uvs
-        fx, fy, cx, cy = K
-        cameraMatrix = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
-        distCoeffs = np.array(D, dtype=np.float64).reshape(-1, 1)
-        pts = np.array(uvs, dtype=np.float64).reshape(-1, 1, 2)
-        und = cv.undistortPoints(pts, cameraMatrix, distCoeffs, P=cameraMatrix)
-        und = und.reshape(-1, 2)
-        return [tuple(p) for p in und]
-
-    @staticmethod
-    def umeyama_similarity(A: np.ndarray, B: np.ndarray):
-        assert A.shape[0] == 2 and B.shape[0] == 2 and A.shape[1] == B.shape[1]
-        N = A.shape[1]
-        mu_A = A.mean(axis=1, keepdims=True)
-        mu_B = B.mean(axis=1, keepdims=True)
-        A0 = A - mu_A
-        B0 = B - mu_B
-        var_A = (A0**2).sum() / N
-        C = (B0 @ A0.T) / N
-        U, S, Vt = np.linalg.svd(C)
-        R = U @ Vt
-        if np.linalg.det(R) < 0:
-            Vt[1, :] *= -1
-            R = U @ Vt
-        s = (S @ np.ones_like(S)) / var_A
-        t = (mu_B - s * R @ mu_A).reshape(2)
-        return float(s), R, t
-
-    def constellation_match(self, uvL, uvR, px_gate, symmetric=True):
-        if len(uvL) == 0 or len(uvR) == 0:
-            return [] , None
-        A = np.array(uvL, dtype=np.float64).T
-        B = np.array(uvR, dtype=np.float64).T
-        # balance counts
-        if A.shape[1] != B.shape[1]:
-            if A.shape[1] > B.shape[1]:
-                idx = np.argsort(((A - A.mean(axis=1, keepdims=True))**2).sum(axis=0))[:B.shape[1]]
-                A_fit = A[:, idx]
-                B_fit = B
-            else:
-                idx = np.argsort(((B - B.mean(axis=1, keepdims=True))**2).sum(axis=0))[:A.shape[1]]
-                A_fit = A
-                B_fit = B[:, idx]
-        else:
-            A_fit, B_fit = A, B
-        s, R, t = self.umeyama_similarity(A_fit, B_fit)
-        A2 = (s * (R @ A)) + t.reshape(2,1)
-        matches_LR = {}
-        for i in range(A2.shape[1]):
-            diffs = B.T - A2[:, i].reshape(1,2)
-            d2 = np.sum(diffs**2, axis=1)
-            j = int(np.argmin(d2))
-            if math.sqrt(float(d2[j])) <= px_gate:
-                matches_LR[i] = j
-        if not symmetric:
-            rms = self.rms_after_map(A2, B, matches_LR)
-            return list(matches_LR.items()), rms
-        s2, R2, t2 = self.umeyama_similarity(B_fit, A_fit)
-        B2 = (s2 * (R2 @ B)) + t2.reshape(2,1)
-        matches_RL = {}
-        for j in range(B2.shape[1]):
-            diffs = A.T - B2[:, j].reshape(1,2)
-            d2 = np.sum(diffs**2, axis=1)
-            i = int(np.argmin(d2))
-            if math.sqrt(float(d2[i])) <= px_gate:
-                matches_RL[j] = i
-        matches = []
-        for i, j in matches_LR.items():
-            if j in matches_RL and matches_RL[j] == i:
-                matches.append((i, j))
-        rms = self.rms_after_map(A2, B, dict(matches))
-        return matches, rms
-
-    @staticmethod
-    def rms_after_map(A2: np.ndarray, B: np.ndarray, matches_dict):
-        if not matches_dict:
-            return None
-        errs = []
-        for i, j in matches_dict.items():
-            e = np.linalg.norm(A2[:, i] - B[:, j])
-            errs.append(float(e))
-        if not errs:
-            return None
-        return float(np.sqrt(np.mean(np.square(errs))))
-
-    def try_fuse(self):
-        if self.left_last is None or self.right_last is None:
-            return
-        stampL, uvL, ptsL, raysL, oL, dbgL = self.left_last
-        stampR, uvR, ptsR, raysR, oR, dbgR = self.right_last
-
-        mode = self.get_parameter('assoc_mode').get_parameter_value().string_value
-        px_gate = float(self.get_parameter('assoc_pixel_gate').get_parameter_value().double_value)
-        symmetric = self.get_parameter('symmetric_match').get_parameter_value().bool_value
-
-        if mode == 'constellation':
-            matches, rms = self.constellation_match(uvL, uvR, px_gate, symmetric)
-            if rms is not None:
-                self.pub_const_rms.publish(Float32(data=rms))
-        else:
-            okR, Rwc_R, t_w_R = self.lookup_world_T_cam(self.right_cam_frame, stampR)
-            okL, Rwc_L, t_w_L = self.lookup_world_T_cam(self.left_cam_frame, stampL)
-            if not (okR and okL) or self.right_K is None or self.left_K is None:
-                return
-            fxR, fyR, cxR, cyR = self.right_K
-            fxL, fyL, cxL, cyL = self.left_K
-            use_und = self.get_parameter('use_undistort_assoc').get_parameter_value().bool_value
-            uvL_cmp = self.undistort_uvs(uvL, self.left_K, self.left_D) if use_und else uvL
-            uvR_cmp = self.undistort_uvs(uvR, self.right_K, self.right_D) if use_und else uvR
-
-            matches_LR = {}
-            for i, p_w in enumerate(ptsL):
-                u_pred, v_pred, ok = self.project_world_to_cam_px(p_w, Rwc_R, t_w_R, fxR, fyR, cxR, cyR)
-                if not ok:
+        if symmetric:
+            l2r = np.argmin(dists, axis=1)
+            r2l = np.argmin(dists, axis=0)
+            for li, rj0 in enumerate(l2r):
+                if dists[li, rj0] > gate:
                     continue
-                j_best, best_d = -1, 1e9
-                for j, (uR, vR) in enumerate(uvR_cmp):
-                    dpx = math.hypot(uR - u_pred, vR - v_pred)
-                    if dpx < best_d:
-                        best_d, j_best = dpx, j
-                if j_best >= 0 and best_d <= px_gate:
-                    matches_LR[i] = j_best
-
-            if symmetric:
-                matches_RL = {}
-                for j, p_w in enumerate(ptsR):
-                    u_pred, v_pred, ok = self.project_world_to_cam_px(p_w, Rwc_L, t_w_L, fxL, fyL, cxL, cyL)
-                    if not ok:
-                        continue
-                    i_best, best_d = -1, 1e9
-                    for i, (uL, vL) in enumerate(uvL_cmp):
-                        dpx = math.hypot(uL - u_pred, vL - v_pred)
-                        if dpx < best_d:
-                            best_d, i_best = dpx, i
-                    if i_best >= 0 and best_d <= px_gate:
-                        matches_RL[j] = i_best
-                matches = []
-                for i, j in matches_LR.items():
-                    if j in matches_RL and matches_RL[j] == i:
-                        matches.append((i, j))
-            else:
-                matches = list(matches_LR.items())
-
-        # ------- Publish fused plane points (left-trust) -------
-        n, _d = self.get_plane()
-        fused_plane_pts = []
-        for (i, j) in matches:
-            pL = np.array(ptsL[i])
-            fused = pL.copy()
-            if j < len(ptsR):
-                pR = np.array(ptsR[j])
-                fused = 0.75 * pL + 0.25 * pR
-            fused = fused - (n @ fused + _d) * n
-            fused_plane_pts.append(fused)
-
-        out_plane = PoseArray()
-        out_plane.header = Header()
-        out_plane.header.frame_id = self.world_frame
-        out_plane.header.stamp = stampL if Time.from_msg(stampL) > Time.from_msg(stampR) else stampR
-        for p in fused_plane_pts:
-            pose = Pose()
-            pose.position.x, pose.position.y, pose.position.z = [float(v) for v in p]
-            pose.orientation.w = 1.0
-            out_plane.poses.append(pose)
-        self.pub_fused_world.publish(out_plane)
-
-        # Triangulation optional
-        if self.get_parameter('triangulate_3d').get_parameter_value().bool_value and len(matches) > 0:
-            min_ang = float(self.get_parameter('min_ray_angle_deg').get_parameter_value().double_value)
-            out_3d = PoseArray()
-            out_3d.header = out_plane.header
-            for (i, j) in matches:
-                if i >= len(raysL) or j >= len(raysR):
+                if r2l[rj0] != li:
                     continue
-                o1, d1 = np.array(oL), np.array(raysL[i])
-                o2, d2 = np.array(oR), np.array(raysR[j])
-                p_mid, ok = self.triangulate_two_rays(o1, d1, o2, d2)
-                cosang = np.clip(d1 @ d2 / (np.linalg.norm(d1)*np.linalg.norm(d2)), -1.0, 1.0)
-                angle = math.degrees(math.acos(abs(cosang)))
-                if (not ok) or angle < min_ang:
+                iL = L_idx[li]
+                iR = R_idx[rj0]
+                if iR in used_r:
                     continue
-                pose = Pose()
-                pose.position.x, pose.position.y, pose.position.z = [float(v) for v in p_mid]
-                pose.orientation.w = 1.0
-                out_3d.poses.append(pose)
-            self.pub_fused_world_3d.publish(out_3d)
+                used_r.add(iR)
+                pairs.append((iL, iR))
+        else:
+            for li in range(len(L_idx)):
+                rj = int(np.argmin(dists[li]))
+                if dists[li, rj] > gate:
+                    continue
+                iL = L_idx[li]
+                iR = R_idx[rj]
+                if iR in used_r:
+                    continue
+                used_r.add(iR)
+                pairs.append((iL, iR))
 
-    @staticmethod
-    def triangulate_two_rays(o1, d1, o2, d2):
-        d1 = d1 / max(1e-12, np.linalg.norm(d1))
-        d2 = d2 / max(1e-12, np.linalg.norm(d2))
-        w0 = o1 - o2
-        a = float(d1 @ d1)
-        b = float(d1 @ d2)
-        c = float(d2 @ d2)
-        d = float(d1 @ w0)
-        e = float(d2 @ w0)
-        denom = a*c - b*b
-        if abs(denom) < 1e-12:
-            return 0.5*(o1+o2), False
-        s = (b*e - c*d) / denom
-        t = (a*e - b*d) / denom
-        p1 = o1 + s*d1
-        p2 = o2 + t*d2
-        return 0.5*(p1 + p2), True
+        return pairs
 
-    @staticmethod
-    def project_world_to_cam_px(p_w: np.ndarray, Rwc: np.ndarray, t_w: np.ndarray,
-                                fx: float, fy: float, cx: float, cy: float) -> Tuple[float, float, bool]:
-        Rcw = Rwc.T
-        Xc = Rcw @ (p_w - t_w)
-        Z = float(Xc[2])
-        if Z <= 1e-6:
-            return 0.0, 0.0, False
-        u = fx * (Xc[0] / Z) + cx
-        v = fy * (Xc[1] / Z) + cy
-        return float(u), float(v), True
-
-    @staticmethod
-    def poses_from_uv(uvs: List[Tuple[float,float]], header: Header, frame_id: str) -> PoseArray:
-        pa = PoseArray()
-        pa.header = Header()
-        pa.header.stamp = header.stamp
-        pa.header.frame_id = frame_id
-        for (u, v) in uvs:
-            pose = Pose()
-            pose.position.x = float(u)
-            pose.position.y = float(v)
-            pose.position.z = 0.0
-            pose.orientation.w = 1.0
-            pa.poses.append(pose)
-        return pa
+    # --------------------- RViz helpers ---------------------
+    def make_sphere_marker(self, idx: int, header: Header, pos: Point,
+                           scale: Vector3, color_rgba: ColorRGBA, ns: str = 'prisms') -> Marker:
+        m = Marker()
+        m.header = header
+        m.ns = ns
+        m.id = idx
+        m.type = Marker.SPHERE
+        m.action = Marker.ADD
+        m.scale = scale
+        m.color = color_rgba
+        m.pose.position = pos
+        m.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
+        m.lifetime.sec = 0
+        return m
 
 
 def main():
