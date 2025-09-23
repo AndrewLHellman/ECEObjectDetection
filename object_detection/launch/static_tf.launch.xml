@@ -1,0 +1,55 @@
+<launch>
+  <!-- Static transforms: world -> left_camera / right_camera -->
+
+  <!-- LEFT CAMERA: values taken from your camera_tf.txt sample -->
+  <node pkg="tf2_ros" exec="static_transform_publisher"
+        args="-0.014676985486388058 -0.0047754858005039985 0.6855668802615765 0.685407046315142 -0.7144977747493646 -0.1043397098820987 0.09393261244891858 world left_camera"/>
+
+  <!-- RIGHT CAMERA: REPLACE these numbers with your right camera values -->
+  <node pkg="tf2_ros" exec="static_transform_publisher"
+        args="0.09563102883499701 0.014364377620290716 0.7006117839035886 -0.6876916345481976 0.7220765488618838 -0.06133401156532736 0.043861285679331126 world right_camera"/>
+
+  <!-- Prism centroid detector with inside-node two-camera fusion and 3D triangulation -->
+  <node pkg="object_detection" exec="prism_centroid_detector_fused" name="prism_centroid_detector_fused">
+    <!-- Frames -->
+    <param name="world_frame" value="world"/>
+    <param name="left_cam_frame" value="left_camera"/>
+    <param name="right_cam_frame" value="right_camera"/>
+
+    <!-- Image & CameraInfo topics (change if yours differ) -->
+    <param name="left_image" value="/stereo/left/image_raw"/>
+    <param name="right_image" value="/stereo/right/image_raw"/>
+    <param name="left_info" value="/stereo/left/camera_info"/>
+    <param name="right_info" value="/stereo/right/camera_info"/>
+
+    <!-- Detection thresholds (tune as needed) -->
+    <param name="use_adaptive" value="true"/>
+    <param name="binary_inv" value="true"/>
+    <param name="blur_ksize" value="5"/>
+    <param name="adaptive_block" value="31"/>
+    <param name="adaptive_C" value="5"/>
+    <param name="global_thresh" value="60"/>
+    <param name="morph_open" value="3"/>
+    <param name="morph_close" value="3"/>
+
+    <param name="min_area" value="400.0"/>
+    <param name="max_area" value="1000000.0"/>
+    <param name="min_solidity" value="0.75"/>
+    <param name="min_rectangularity" value="0.65"/>
+    <param name="min_aspect" value="0.2"/>
+    <param name="max_aspect" value="5.0"/>
+
+    <!-- Association & fusion -->
+    <param name="assoc_pixel_gate" value="12.0"/>
+    <param name="symmetric_match" value="true"/>
+
+    <!-- Plane selection (z=0 in world by default) -->
+    <param name="use_general_plane" value="false"/>
+    <param name="plane_n" value="[0.0, 0.0, 1.0]"/>
+    <param name="plane_d" value="0.0"/>
+
+    <!-- True 3D triangulation controls -->
+    <param name="triangulate_3d" value="true"/>
+    <param name="min_ray_angle_deg" value="2.0"/>
+  </node>
+</launch>

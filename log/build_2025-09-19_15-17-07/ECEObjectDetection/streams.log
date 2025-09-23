@@ -1,0 +1,37 @@
+[0.770s] Invoking command in '/home/alhdnb/ros2_ws/src/ECEObjectDetection': PYTHONPATH=/home/alhdnb/ros2_ws/src/ECEObjectDetection/build/ECEObjectDetection/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/alhdnb/ros2_ws/src/ECEObjectDetection/install/ECEObjectDetection/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base build/ECEObjectDetection build --build-base /home/alhdnb/ros2_ws/src/ECEObjectDetection/build/ECEObjectDetection/build install --record /home/alhdnb/ros2_ws/src/ECEObjectDetection/build/ECEObjectDetection/install.log --single-version-externally-managed install_data
+[0.962s] running egg_info
+[0.965s] creating build/ECEObjectDetection/ECEObjectDetection.egg-info
+[0.969s] writing build/ECEObjectDetection/ECEObjectDetection.egg-info/PKG-INFO
+[0.973s] writing dependency_links to build/ECEObjectDetection/ECEObjectDetection.egg-info/dependency_links.txt
+[0.976s] writing entry points to build/ECEObjectDetection/ECEObjectDetection.egg-info/entry_points.txt
+[0.979s] writing requirements to build/ECEObjectDetection/ECEObjectDetection.egg-info/requires.txt
+[0.983s] writing top-level names to build/ECEObjectDetection/ECEObjectDetection.egg-info/top_level.txt
+[0.997s] writing manifest file 'build/ECEObjectDetection/ECEObjectDetection.egg-info/SOURCES.txt'
+[1.007s] reading manifest file 'build/ECEObjectDetection/ECEObjectDetection.egg-info/SOURCES.txt'
+[1.011s] adding license file 'LICENSE'
+[1.015s] writing manifest file 'build/ECEObjectDetection/ECEObjectDetection.egg-info/SOURCES.txt'
+[1.020s] running build
+[1.025s] running build_py
+[1.031s] creating /home/alhdnb/ros2_ws/src/ECEObjectDetection/build/ECEObjectDetection/build
+[1.035s] creating /home/alhdnb/ros2_ws/src/ECEObjectDetection/build/ECEObjectDetection/build/lib
+[1.040s] creating /home/alhdnb/ros2_ws/src/ECEObjectDetection/build/ECEObjectDetection/build/lib/ECEObjectDetection
+[1.044s] copying ECEObjectDetection/ECEObjectDetection.py -> /home/alhdnb/ros2_ws/src/ECEObjectDetection/build/ECEObjectDetection/build/lib/ECEObjectDetection
+[1.048s] copying ECEObjectDetection/__init__.py -> /home/alhdnb/ros2_ws/src/ECEObjectDetection/build/ECEObjectDetection/build/lib/ECEObjectDetection
+[1.052s] running install
+[1.055s] running install_lib
+[1.059s] creating /home/alhdnb/ros2_ws/src/ECEObjectDetection/install/ECEObjectDetection/lib/python3.10/site-packages/ECEObjectDetection
+[1.063s] copying /home/alhdnb/ros2_ws/src/ECEObjectDetection/build/ECEObjectDetection/build/lib/ECEObjectDetection/ECEObjectDetection.py -> /home/alhdnb/ros2_ws/src/ECEObjectDetection/install/ECEObjectDetection/lib/python3.10/site-packages/ECEObjectDetection
+[1.066s] copying /home/alhdnb/ros2_ws/src/ECEObjectDetection/build/ECEObjectDetection/build/lib/ECEObjectDetection/__init__.py -> /home/alhdnb/ros2_ws/src/ECEObjectDetection/install/ECEObjectDetection/lib/python3.10/site-packages/ECEObjectDetection
+[1.070s] byte-compiling /home/alhdnb/ros2_ws/src/ECEObjectDetection/install/ECEObjectDetection/lib/python3.10/site-packages/ECEObjectDetection/ECEObjectDetection.py to ECEObjectDetection.cpython-310.pyc
+[1.073s] byte-compiling /home/alhdnb/ros2_ws/src/ECEObjectDetection/install/ECEObjectDetection/lib/python3.10/site-packages/ECEObjectDetection/__init__.py to __init__.cpython-310.pyc
+[1.079s] running install_data
+[1.084s] creating /home/alhdnb/ros2_ws/src/ECEObjectDetection/install/ECEObjectDetection/share/ament_index
+[1.090s] creating /home/alhdnb/ros2_ws/src/ECEObjectDetection/install/ECEObjectDetection/share/ament_index/resource_index
+[1.094s] creating /home/alhdnb/ros2_ws/src/ECEObjectDetection/install/ECEObjectDetection/share/ament_index/resource_index/packages
+[1.098s] copying resource/ECEObjectDetection -> /home/alhdnb/ros2_ws/src/ECEObjectDetection/install/ECEObjectDetection/share/ament_index/resource_index/packages
+[1.103s] copying package.xml -> /home/alhdnb/ros2_ws/src/ECEObjectDetection/install/ECEObjectDetection/share/ECEObjectDetection
+[1.107s] running install_egg_info
+[1.114s] Copying build/ECEObjectDetection/ECEObjectDetection.egg-info to /home/alhdnb/ros2_ws/src/ECEObjectDetection/install/ECEObjectDetection/lib/python3.10/site-packages/ECEObjectDetection-0.0.0-py3.10.egg-info
+[1.173s] running install_scripts
+[1.190s] writing list of installed files to '/home/alhdnb/ros2_ws/src/ECEObjectDetection/build/ECEObjectDetection/install.log'
+[1.206s] Invoked command in '/home/alhdnb/ros2_ws/src/ECEObjectDetection' returned '0': PYTHONPATH=/home/alhdnb/ros2_ws/src/ECEObjectDetection/build/ECEObjectDetection/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/alhdnb/ros2_ws/src/ECEObjectDetection/install/ECEObjectDetection/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base build/ECEObjectDetection build --build-base /home/alhdnb/ros2_ws/src/ECEObjectDetection/build/ECEObjectDetection/build install --record /home/alhdnb/ros2_ws/src/ECEObjectDetection/build/ECEObjectDetection/install.log --single-version-externally-managed install_data

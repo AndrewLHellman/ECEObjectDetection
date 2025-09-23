@@ -1,0 +1,35 @@
+running egg_info
+creating build/ECEObjectDetection/ECEObjectDetection.egg-info
+writing build/ECEObjectDetection/ECEObjectDetection.egg-info/PKG-INFO
+writing dependency_links to build/ECEObjectDetection/ECEObjectDetection.egg-info/dependency_links.txt
+writing entry points to build/ECEObjectDetection/ECEObjectDetection.egg-info/entry_points.txt
+writing requirements to build/ECEObjectDetection/ECEObjectDetection.egg-info/requires.txt
+writing top-level names to build/ECEObjectDetection/ECEObjectDetection.egg-info/top_level.txt
+writing manifest file 'build/ECEObjectDetection/ECEObjectDetection.egg-info/SOURCES.txt'
+reading manifest file 'build/ECEObjectDetection/ECEObjectDetection.egg-info/SOURCES.txt'
+adding license file 'LICENSE'
+writing manifest file 'build/ECEObjectDetection/ECEObjectDetection.egg-info/SOURCES.txt'
+running build
+running build_py
+creating /home/alhdnb/ros2_ws/src/ECEObjectDetection/build/ECEObjectDetection/build
+creating /home/alhdnb/ros2_ws/src/ECEObjectDetection/build/ECEObjectDetection/build/lib
+creating /home/alhdnb/ros2_ws/src/ECEObjectDetection/build/ECEObjectDetection/build/lib/ECEObjectDetection
+copying ECEObjectDetection/ECEObjectDetection.py -> /home/alhdnb/ros2_ws/src/ECEObjectDetection/build/ECEObjectDetection/build/lib/ECEObjectDetection
+copying ECEObjectDetection/__init__.py -> /home/alhdnb/ros2_ws/src/ECEObjectDetection/build/ECEObjectDetection/build/lib/ECEObjectDetection
+running install
+running install_lib
+creating /home/alhdnb/ros2_ws/src/ECEObjectDetection/install/ECEObjectDetection/lib/python3.10/site-packages/ECEObjectDetection
+copying /home/alhdnb/ros2_ws/src/ECEObjectDetection/build/ECEObjectDetection/build/lib/ECEObjectDetection/ECEObjectDetection.py -> /home/alhdnb/ros2_ws/src/ECEObjectDetection/install/ECEObjectDetection/lib/python3.10/site-packages/ECEObjectDetection
+copying /home/alhdnb/ros2_ws/src/ECEObjectDetection/build/ECEObjectDetection/build/lib/ECEObjectDetection/__init__.py -> /home/alhdnb/ros2_ws/src/ECEObjectDetection/install/ECEObjectDetection/lib/python3.10/site-packages/ECEObjectDetection
+byte-compiling /home/alhdnb/ros2_ws/src/ECEObjectDetection/install/ECEObjectDetection/lib/python3.10/site-packages/ECEObjectDetection/ECEObjectDetection.py to ECEObjectDetection.cpython-310.pyc
+byte-compiling /home/alhdnb/ros2_ws/src/ECEObjectDetection/install/ECEObjectDetection/lib/python3.10/site-packages/ECEObjectDetection/__init__.py to __init__.cpython-310.pyc
+running install_data
+creating /home/alhdnb/ros2_ws/src/ECEObjectDetection/install/ECEObjectDetection/share/ament_index
+creating /home/alhdnb/ros2_ws/src/ECEObjectDetection/install/ECEObjectDetection/share/ament_index/resource_index
+creating /home/alhdnb/ros2_ws/src/ECEObjectDetection/install/ECEObjectDetection/share/ament_index/resource_index/packages
+copying resource/ECEObjectDetection -> /home/alhdnb/ros2_ws/src/ECEObjectDetection/install/ECEObjectDetection/share/ament_index/resource_index/packages
+copying package.xml -> /home/alhdnb/ros2_ws/src/ECEObjectDetection/install/ECEObjectDetection/share/ECEObjectDetection
+running install_egg_info
+Copying build/ECEObjectDetection/ECEObjectDetection.egg-info to /home/alhdnb/ros2_ws/src/ECEObjectDetection/install/ECEObjectDetection/lib/python3.10/site-packages/ECEObjectDetection-0.0.0-py3.10.egg-info
+running install_scripts
+writing list of installed files to '/home/alhdnb/ros2_ws/src/ECEObjectDetection/build/ECEObjectDetection/install.log'

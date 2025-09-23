@@ -1,0 +1,6 @@
+source;share/ECEObjectDetection/hook/pythonpath.ps1
+source;share/ECEObjectDetection/hook/pythonpath.dsv
+source;share/ECEObjectDetection/hook/pythonpath.sh
+source;share/ECEObjectDetection/hook/ament_prefix_path.ps1
+source;share/ECEObjectDetection/hook/ament_prefix_path.dsv
+source;share/ECEObjectDetection/hook/ament_prefix_path.sh
