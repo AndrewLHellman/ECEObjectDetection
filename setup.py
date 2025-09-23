@@ -30,7 +30,7 @@ tests_require=['pytest'],
 entry_points={
 'console_scripts': [
 # maps: ros2 run object_detection object_detector -> object_detection/object_detector.py:main
-'object_detector = object_detection.object_detector:main',
+'object_detector = object_detection.object_detection:main',
 ],
 },
 )

@@ -1,0 +1,3 @@
+[0.000000] (-) TimerEvent: {}
+[0.001297] (-) JobUnselected: {'identifier': 'object_detection'}
+[0.002050] (-) EventReactorShutdown: {}

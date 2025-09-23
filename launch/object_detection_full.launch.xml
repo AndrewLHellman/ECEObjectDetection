@@ -1,22 +1,23 @@
 <launch>
   <!-- Static transforms: world -> left_camera / right_camera -->
 
-  <!-- LEFT CAMERA: values taken from your camera_tf.txt sample -->
+  <!-- LEFT CAMERA: from your values -->
   <node pkg="tf2_ros" exec="static_transform_publisher"
         args="-0.014676985486388058 -0.0047754858005039985 0.6855668802615765 0.685407046315142 -0.7144977747493646 -0.1043397098820987 0.09393261244891858 world left_camera"/>
 
-  <!-- RIGHT CAMERA: REPLACE these numbers with your right camera values -->
+  <!-- RIGHT CAMERA: from your values -->
   <node pkg="tf2_ros" exec="static_transform_publisher"
-        args="0.09563102883499701 0.014364377620290716 0.7006117839035886 -0.6876916345481976 0.7220765488618838 -0.06133401156532736 0.043861285679331126 world right_camera"/>
+        args="0.033871834234873985 -0.014851401895387344 0.703589542822821 -0.6872906995806659 0.7241919226481899 -0.033391629695388544 0.04541533339438254 world right_camera"/>
 
-  <!-- Prism centroid detector with inside-node two-camera fusion and 3D triangulation -->
-  <node pkg="object_detection" exec="prism_centroid_detector_fused" name="prism_centroid_detector_fused">
+  <!-- Object detector with inside-node two-camera fusion + 3D triangulation -->
+  <!-- NOTE: exec updated to 'object_detector' to match your renamed node -->
+  <node pkg="object_detection" exec="object_detector" name="object_detector">
     <!-- Frames -->
     <param name="world_frame" value="world"/>
     <param name="left_cam_frame" value="left_camera"/>
     <param name="right_cam_frame" value="right_camera"/>
 
-    <!-- Image & CameraInfo topics (change if yours differ) -->
+    <!-- Image & CameraInfo topics -->
     <param name="left_image" value="/stereo/left/image_raw"/>
     <param name="right_image" value="/stereo/right/image_raw"/>
     <param name="left_info" value="/stereo/left/camera_info"/>
